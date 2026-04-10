@@ -2,14 +2,26 @@
 
 A Python gateway that exposes a small, stable MCP tool surface over a dynamic set of downstream MCP servers.
 
+## Why this exists
+
+Current MCP integrations are good at exposing a server's full tool list, but much weaker at controlled, progressive disclosure.
+
+- `tools.listChanged` and related tool-change notification handling are uneven across clients and servers, so relying on dynamic tool-surface updates is fragile in practice.
+- Skill systems generally do not have a first-class way to reference a tool from a skill, defer schema disclosure until it is actually needed, and then invoke that tool through the same reference.
+- That often forces people to copy JSON schemas into skills or prompts by hand and keep them updated manually, even though the authoritative contract already exists on an MCP server.
+
+This gateway solves that by putting a stable virtual registry in front of downstream servers. A skill can reference the gateway plus a virtual tool path, discover or search for tools cheaply, disclose the real schema on demand with `describe_tool`, and then invoke the tool once that path has been explicitly disclosed for the session.
+
 ## Features
 
 - Frontend transport: Streamable HTTP
 - Downstream transports: stdio, Streamable HTTP, SSE
-- Virtual tool registry with path-based progressive disclosure
+- Stable virtual tool registry with path-based progressive disclosure
 - Session-gated invocation via `describe_tool` + session header path disclosure
+- On-demand schema disclosure, so skills do not need to inline and manually maintain downstream tool schemas
 - Header-aware filtering and header forwarding on every downstream tool call
 - Background downstream refresh with cached tool lists
+- Explicit `refresh_registry` control instead of depending on clients to handle downstream tool-change notifications well
 - Semantic fallback suggestions using spaCy when a requested tool path does not exist
 
 ## Virtual tools exposed by the gateway
@@ -32,8 +44,10 @@ python -m gateway.server --config sample-config.json --host 127.0.0.1 --port 808
 ## Notes
 
 - The gateway MCP endpoint is `POST /mcp`.
+- The initial tool surface stays small and stable; downstream tool schemas are revealed through `describe_tool` only when a client or skill asks for a specific path.
 - The gateway forwards request headers to downstream tool calls, excluding a small set of hop-by-hop HTTP headers.
 - Use `X-Session-Id` to control disclosure state explicitly. If omitted, the transport `Mcp-Session-Id` is used.
+- `refresh_registry` is available when you need deterministic pickup of downstream tool changes without relying on `tools.listChanged` handling across the whole stack.
 - When a tool is missing, the gateway returns semantic suggestions based on path/name/description similarity.
 
 ## Example JSON-RPC calls
