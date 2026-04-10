@@ -64,4 +64,4 @@ Thumbs.db
 ### Claude Code ###
 .claude/settings.local.json
 
-__pycache__/**
+gateway/__pycache__
