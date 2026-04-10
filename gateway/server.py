@@ -1,30 +1,25 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import logging
-from typing import Any, Dict, List
+from contextlib import asynccontextmanager
+from typing import Annotated, Any, AsyncIterator
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 import uvicorn
+from mcp.server.fastmcp import Context, FastMCP
+from pydantic import Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from .clients import MCPError, build_client
 from .config import GatewayConfigModel, load_config
-from .models import DownstreamTool
 from .registry import ToolRegistry
 from .semantic import SemanticMatcher
 
 logger = logging.getLogger(__name__)
 
-JSONRPC_VERSION = "2.0"
-VIRTUAL_TOOL_NAMES = {
-    "browse_tools",
-    "search_tools",
-    "describe_tool",
-    "invoke_tool",
-    "refresh_registry",
-}
+DISCLOSURE_SESSION_HEADER = "x-session-id"
+MCP_SESSION_HEADER = "mcp-session-id"
 
 
 class GatewayServer:
@@ -32,244 +27,160 @@ class GatewayServer:
         self.config = config
         clients = {item.server_id: build_client(item.to_internal()) for item in config.clients}
         self.registry = ToolRegistry(clients=clients, matcher=SemanticMatcher.create())
-        self.app = FastAPI(title="virtual-mcp-gateway")
-        self._configure_routes()
+        self.mcp = FastMCP(
+            name="virtual-mcp-gateway",
+            instructions="Virtual MCP gateway over downstream stdio, streamable HTTP, and SSE servers.",
+            lifespan=self._lifespan,
+            streamable_http_path="/mcp",
+        )
+        self._register_tools()
+        self._register_routes()
+        self.app = self.mcp.streamable_http_app()
+
+    @asynccontextmanager
+    async def _lifespan(self, _: FastMCP) -> AsyncIterator[None]:
+        await self.startup()
+        try:
+            yield
+        finally:
+            await self.shutdown()
 
     async def startup(self) -> None:
         await self.registry.start()
-        logger.info("Gateway started with %d downstream clients and %d tools", len(self.registry.clients), len(self.registry.tools_by_path))
+        logger.info(
+            "Gateway started with %d downstream clients and %d tools",
+            len(self.registry.clients),
+            len(self.registry.tools_by_path),
+        )
 
     async def shutdown(self) -> None:
         await self.registry.stop()
 
-    def _configure_routes(self) -> None:
-        @self.app.on_event("startup")
-        async def _startup() -> None:
-            await self.startup()
+    async def _health_endpoint(self, _: Request) -> JSONResponse:
+        return JSONResponse(self.health_payload())
 
-        @self.app.on_event("shutdown")
-        async def _shutdown() -> None:
-            await self.shutdown()
-
-        @self.app.get("/health")
-        async def health() -> Dict[str, Any]:
-            return {
-                "ok": True,
-                "clients": list(self.registry.clients.keys()),
-                "tool_count": len(self.registry.tools_by_path),
-                "spacy_model": self.registry.matcher.model_name,
-            }
-
-        @self.app.post("/mcp")
-        async def mcp_endpoint(request: Request) -> JSONResponse:
-            body = await request.json()
-            headers = _normalize_headers(dict(request.headers))
-            method = body.get("method")
-            params = body.get("params") or {}
-            request_id = body.get("id")
-
-            try:
-                if method == "initialize":
-                    result = self._handle_initialize()
-                elif method == "notifications/initialized":
-                    return JSONResponse(status_code=202, content={})
-                elif method == "tools/list":
-                    result = await self._handle_tools_list(headers)
-                elif method == "tools/call":
-                    result = await self._handle_tools_call(params, headers)
-                else:
-                    return _jsonrpc_error(request_id, -32601, f"Method not found: {method}")
-                if request_id is None:
-                    return JSONResponse(status_code=202, content={})
-                return JSONResponse(content={"jsonrpc": JSONRPC_VERSION, "id": request_id, "result": result})
-            except GatewayHTTPError as exc:
-                return _jsonrpc_error(request_id, exc.code, exc.message, exc.data)
-            except Exception as exc:
-                logger.exception("Unhandled gateway error")
-                return _jsonrpc_error(request_id, -32000, str(exc))
-
-    def _handle_initialize(self) -> Dict[str, Any]:
+    def health_payload(self) -> dict[str, Any]:
         return {
-            "protocolVersion": self.config.protocol_version,
-            "capabilities": {
-                "tools": {"listChanged": False},
-            },
-            "serverInfo": {"name": "virtual-mcp-gateway", "version": "0.1.0"},
+            "ok": True,
+            "clients": list(self.registry.clients.keys()),
+            "tool_count": len(self.registry.tools_by_path),
+            "spacy_model": self.registry.matcher.model_name,
         }
 
-    async def _handle_tools_list(self, headers: Dict[str, str]) -> Dict[str, Any]:
-        tools = [
-            {
-                "name": "browse_tools",
-                "description": "Browse virtual tools by hierarchical path prefix.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "path_prefix": {"type": "string"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 500},
-                    },
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "name": "search_tools",
-                "description": "Search the virtual tool registry by text query. Uses spaCy similarity when available.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 50},
-                    },
-                    "required": ["query"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "name": "describe_tool",
-                "description": "Reveal the full schema for a virtual tool and register that disclosure in the current session.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "tool_path": {"type": "string"},
-                    },
-                    "required": ["tool_path"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "name": "invoke_tool",
-                "description": "Invoke a virtual tool that has already been disclosed in this session.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "tool_path": {"type": "string"},
-                        "arguments": {"type": "object"},
-                        "schema_digest": {"type": "string"},
-                    },
-                    "required": ["tool_path", "arguments", "schema_digest"],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "name": "refresh_registry",
-                "description": "Refresh downstream tool caches immediately.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
-                },
-            },
-        ]
-        return {"tools": tools}
+    def _register_tools(self) -> None:
+        self.mcp.add_tool(
+            self._browse_tools_tool,
+            name="browse_tools",
+            description="Browse virtual tools by hierarchical path prefix.",
+        )
+        self.mcp.add_tool(
+            self._search_tools_tool,
+            name="search_tools",
+            description="Search the virtual tool registry by text query. Uses spaCy similarity when available.",
+        )
+        self.mcp.add_tool(
+            self._describe_tool_tool,
+            name="describe_tool",
+            description="Reveal the full schema for a virtual tool and register that disclosure in the current session.",
+        )
+        self.mcp.add_tool(
+            self._invoke_tool_tool,
+            name="invoke_tool",
+            description="Invoke a virtual tool that has already been disclosed in this session.",
+        )
+        self.mcp.add_tool(
+            self._refresh_registry_tool,
+            name="refresh_registry",
+            description="Refresh downstream tool caches immediately.",
+        )
 
-    async def _handle_tools_call(self, params: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
-        name = params.get("name")
-        arguments = params.get("arguments") or {}
-        if name not in VIRTUAL_TOOL_NAMES:
-            raise GatewayHTTPError(-32602, f"Unknown gateway tool: {name}")
-        if name == "browse_tools":
-            return self._wrap_content(await self._browse_tools(arguments, headers))
-        if name == "search_tools":
-            return self._wrap_content(await self._search_tools(arguments, headers))
-        if name == "describe_tool":
-            return self._wrap_content(await self._describe_tool(arguments, headers))
-        if name == "invoke_tool":
-            return await self._invoke_tool(arguments, headers)
-        if name == "refresh_registry":
-            await self.registry.refresh_all()
-            return self._wrap_content({"refreshed": True, "tool_count": len(self.registry.tools_by_path)})
-        raise GatewayHTTPError(-32602, f"Unsupported tool call: {name}")
+    def _register_routes(self) -> None:
+        self.mcp.custom_route("/health", methods=["GET"])(self._health_endpoint)
 
-    def _wrap_content(self, value: Any) -> Dict[str, Any]:
-        return {
-            "content": [
-                {
-                    "type": "text",
-                    "text": _json_dumps(value),
-                }
-            ],
-            "structuredContent": value,
-        }
-
-    async def _browse_tools(self, arguments: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
-        path_prefix = str(arguments.get("path_prefix") or "").strip()
-        limit = int(arguments.get("limit") or 100)
-        tools = self.registry.filtered_tools(headers=headers, path_prefix=path_prefix)[:limit]
+    async def _browse_tools_tool(
+        self,
+        ctx: Context,
+        path_prefix: str = "",
+        limit: Annotated[int, Field(ge=1, le=500)] = 100,
+    ) -> dict[str, Any]:
+        headers = _headers_from_context(ctx)
+        tools = self.registry.filtered_tools(headers=headers, path_prefix=path_prefix.strip())[:limit]
         return {
             "items": [
                 {
                     "path": tool.path,
                     "tool_name": tool.tool_name,
                     "description": tool.description,
-                    "schema_digest": tool.schema_digest,
                 }
                 for tool in tools
             ],
             "count": len(tools),
         }
 
-    async def _search_tools(self, arguments: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
-        query = str(arguments.get("query") or "").strip()
-        if not query:
-            raise GatewayHTTPError(-32602, "search_tools requires a non-empty query")
-        limit = int(arguments.get("limit") or 10)
-        suggestions = self.registry.suggest_tools(query=query, headers=headers, limit=limit)
-        return {"query": query, "matches": suggestions, "spacy_model": self.registry.matcher.model_name}
+    async def _search_tools_tool(
+        self,
+        query: str,
+        ctx: Context,
+        limit: Annotated[int, Field(ge=1, le=50)] = 10,
+    ) -> dict[str, Any]:
+        headers = _headers_from_context(ctx)
+        normalized_query = query.strip()
+        if not normalized_query:
+            raise ValueError("search_tools requires a non-empty query")
+        suggestions = self.registry.suggest_tools(query=normalized_query, headers=headers, limit=limit)
+        return {
+            "query": normalized_query,
+            "matches": suggestions,
+            "spacy_model": self.registry.matcher.model_name,
+        }
 
-    async def _describe_tool(self, arguments: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
-        tool_path = str(arguments.get("tool_path") or "").strip()
-        if not tool_path:
-            raise GatewayHTTPError(-32602, "describe_tool requires tool_path")
-        tool = self.registry.find_tool(tool_path)
+    async def _describe_tool_tool(self, tool_path: str, ctx: Context) -> dict[str, Any]:
+        headers = _headers_from_context(ctx)
+        normalized_tool_path = tool_path.strip()
+        if not normalized_tool_path:
+            raise ValueError("describe_tool requires tool_path")
+
+        tool = self.registry.find_tool(normalized_tool_path)
         if tool is None:
-            suggestions = self.registry.suggest_tools(tool_path, headers=headers, limit=5)
-            raise GatewayHTTPError(
-                -32004,
-                f"Virtual tool not found: {tool_path}",
-                {"suggestions": suggestions},
-            )
+            suggestions = self.registry.suggest_tools(normalized_tool_path, headers=headers, limit=5)
+            raise ValueError(f"Virtual tool not found: {normalized_tool_path}. Suggestions: {suggestions}")
+
         session = self.registry.get_or_create_session(_session_id(headers))
         session.last_headers = headers
-        disclosure = session.disclose(tool.path, tool.schema_digest, ttl_seconds=self.config.disclosure_ttl_seconds)
+        disclosure = session.disclose(tool.path, ttl_seconds=self.config.disclosure_ttl_seconds)
         return {
             "tool_path": tool.path,
             "tool_name": tool.tool_name,
             "server_id": tool.server_id,
             "description": tool.description,
             "input_schema": tool.input_schema,
-            "schema_digest": tool.schema_digest,
             "disclosed_at": disclosure.disclosed_at,
             "expires_at": disclosure.expires_at,
+            "session_header_name": DISCLOSURE_SESSION_HEADER,
         }
 
-    async def _invoke_tool(self, arguments: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
-        tool_path = str(arguments.get("tool_path") or "").strip()
-        if not tool_path:
-            raise GatewayHTTPError(-32602, "invoke_tool requires tool_path")
-        schema_digest = str(arguments.get("schema_digest") or "").strip()
-        call_args = arguments.get("arguments")
-        if not isinstance(call_args, dict):
-            raise GatewayHTTPError(-32602, "invoke_tool requires an object in arguments")
+    async def _invoke_tool_tool(
+        self,
+        tool_path: str,
+        arguments: dict[str, Any],
+        ctx: Context,
+    ) -> dict[str, Any]:
+        headers = _headers_from_context(ctx)
+        normalized_tool_path = tool_path.strip()
+        if not normalized_tool_path:
+            raise ValueError("invoke_tool requires tool_path")
 
-        tool = self.registry.find_tool(tool_path)
+        tool = self.registry.find_tool(normalized_tool_path)
         if tool is None:
-            suggestions = self.registry.suggest_tools(tool_path, headers=headers, limit=5)
-            raise GatewayHTTPError(
-                -32004,
-                f"Virtual tool not found: {tool_path}",
-                {"suggestions": suggestions},
-            )
+            suggestions = self.registry.suggest_tools(normalized_tool_path, headers=headers, limit=5)
+            raise ValueError(f"Virtual tool not found: {normalized_tool_path}. Suggestions: {suggestions}")
 
         session = self.registry.get_or_create_session(_session_id(headers))
         session.last_headers = headers
-        if not session.validate(tool_path, schema_digest):
-            raise GatewayHTTPError(
-                -32010,
-                "Tool invocation denied. Call describe_tool first with the same tool_path and use the current schema_digest.",
-                {
-                    "tool_path": tool_path,
-                    "current_schema_digest": tool.schema_digest,
-                },
+        if not session.validate(normalized_tool_path):
+            raise ValueError(
+                "Tool invocation denied. Call describe_tool first for the same path or an ancestor path in the "
+                f"current {DISCLOSURE_SESSION_HEADER} session."
             )
 
         forwarded_headers = _forwardable_headers(headers)
@@ -279,62 +190,57 @@ class GatewayServer:
 
         client = self.registry.clients[tool.server_id]
         try:
-            downstream_result = await client.call_tool(tool.tool_name, call_args, forwarded_headers=forwarded_headers)
+            downstream_result = await client.call_tool(
+                tool.tool_name,
+                arguments,
+                forwarded_headers=forwarded_headers,
+            )
         except MCPError as exc:
-            raise GatewayHTTPError(-32020, f"Downstream tool call failed: {exc}") from exc
+            raise RuntimeError(f"Downstream tool call failed: {exc}") from exc
 
         if isinstance(downstream_result, dict):
             return downstream_result
-        return self._wrap_content(downstream_result)
+        return {"value": downstream_result}
+
+    async def _refresh_registry_tool(self) -> dict[str, Any]:
+        await self.registry.refresh_all()
+        return {"refreshed": True, "tool_count": len(self.registry.tools_by_path)}
 
 
-class GatewayHTTPError(RuntimeError):
-    def __init__(self, code: int, message: str, data: Any | None = None):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.data = data
+def _session_id(headers: dict[str, str]) -> str:
+    return headers.get(DISCLOSURE_SESSION_HEADER) or headers.get(MCP_SESSION_HEADER) or "default"
 
 
-def _session_id(headers: Dict[str, str]) -> str:
-    return headers.get("mcp-session-id") or headers.get("x-session-id") or "default"
-
-
-def _normalize_headers(headers: Dict[str, str]) -> Dict[str, str]:
+def _normalize_headers(headers: dict[str, str]) -> dict[str, str]:
     return {str(key).lower(): str(value) for key, value in headers.items()}
 
 
-def _forwardable_headers(headers: Dict[str, str]) -> Dict[str, str]:
+def _forwardable_headers(headers: dict[str, str]) -> dict[str, str]:
     blocked = {
+        "accept",
+        "connection",
         "content-length",
         "content-type",
         "host",
-        "connection",
+        "last-event-id",
+        "mcp-protocol-version",
+        MCP_SESSION_HEADER,
+        DISCLOSURE_SESSION_HEADER,
     }
     return {key: value for key, value in headers.items() if key not in blocked}
 
 
-def _json_dumps(value: Any) -> str:
-    import json
-
-    return json.dumps(value, sort_keys=True, indent=2, default=str)
-
-
-def _jsonrpc_error(request_id: Any, code: int, message: str, data: Any | None = None) -> JSONResponse:
-    payload: Dict[str, Any] = {
-        "jsonrpc": JSONRPC_VERSION,
-        "id": request_id,
-        "error": {
-            "code": code,
-            "message": message,
-        },
-    }
-    if data is not None:
-        payload["error"]["data"] = data
-    return JSONResponse(status_code=200, content=payload)
+def _headers_from_context(ctx: Context) -> dict[str, str]:
+    request = ctx.request_context.request
+    if request is None:
+        return {}
+    raw_headers = getattr(request, "headers", None)
+    if raw_headers is None:
+        return {}
+    return _normalize_headers(dict(raw_headers))
 
 
-def build_app(config_path: str) -> FastAPI:
+def build_app(config_path: str) -> Any:
     config = load_config(config_path)
     gateway = GatewayServer(config)
     return gateway.app

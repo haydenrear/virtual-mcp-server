@@ -3,10 +3,8 @@ from __future__ import annotations
 import abc
 import asyncio
 import contextlib
-import json
 import logging
 from typing import Any, Dict, List, Optional
-from urllib.parse import urljoin
 
 import httpx
 
@@ -14,7 +12,29 @@ from .models import ClientConfig, DownstreamTool
 
 logger = logging.getLogger(__name__)
 
-JSONRPC_VERSION = "2.0"
+CLIENT_NAME = "virtual-mcp-gateway"
+CLIENT_VERSION = "0.1.0"
+
+_MCP_IMPORT_ERROR: Exception | None = None
+
+try:
+    from mcp import ClientSession, StdioServerParameters, types as mcp_types
+    from mcp.client.sse import sse_client
+    from mcp.client.stdio import stdio_client
+except ImportError as exc:  # pragma: no cover - exercised only in misconfigured environments.
+    ClientSession = None  # type: ignore[assignment]
+    StdioServerParameters = None  # type: ignore[assignment]
+    mcp_types = None  # type: ignore[assignment]
+    sse_client = None  # type: ignore[assignment]
+    stdio_client = None  # type: ignore[assignment]
+    _MCP_IMPORT_ERROR = exc
+
+try:
+    from mcp.client.streamable_http import streamable_http_client
+except ImportError as exc:  # pragma: no cover - exercised only when an older SDK is installed.
+    streamable_http_client = None  # type: ignore[assignment]
+    if _MCP_IMPORT_ERROR is None:
+        _MCP_IMPORT_ERROR = exc
 
 
 class MCPError(RuntimeError):
@@ -24,7 +44,6 @@ class MCPError(RuntimeError):
 class DownstreamClient(abc.ABC):
     def __init__(self, config: ClientConfig):
         self.config = config
-        self._request_id = 0
         self._initialize_lock = asyncio.Lock()
         self._initialized = False
         self.cached_tools: Dict[str, DownstreamTool] = {}
@@ -32,10 +51,6 @@ class DownstreamClient(abc.ABC):
     @property
     def server_id(self) -> str:
         return self.config.server_id
-
-    def next_request_id(self) -> int:
-        self._request_id += 1
-        return self._request_id
 
     async def ensure_initialized(self) -> None:
         async with self._initialize_lock:
@@ -71,83 +86,57 @@ class DownstreamClient(abc.ABC):
         self.cached_tools = {tool.path: tool for tool in tools}
         return tools
 
-    def _normalize_tools(self, payload: List[Dict[str, Any]]) -> List[DownstreamTool]:
+    async def close(self) -> None:
+        return None
+
+    def _normalize_tools(self, payload: List[Any]) -> List[DownstreamTool]:
         results: List[DownstreamTool] = []
         prefix = self.config.tool_path_prefix.strip("/")
         namespace = prefix or self.server_id
         for item in payload:
+            raw = _model_to_dict(item)
             tool = DownstreamTool(
                 server_id=self.server_id,
-                tool_name=item["name"],
-                description=item.get("description", ""),
-                input_schema=item.get("inputSchema") or item.get("input_schema") or {},
-                annotations=item.get("annotations"),
-                title=item.get("title"),
-                output_schema=item.get("outputSchema") or item.get("output_schema"),
+                tool_name=str(raw["name"]),
+                description=str(raw.get("description") or ""),
+                input_schema=raw.get("inputSchema") or raw.get("input_schema") or {},
+                annotations=raw.get("annotations"),
+                title=raw.get("title"),
+                output_schema=raw.get("outputSchema") or raw.get("output_schema"),
                 namespace=namespace,
-                tags=item.get("tags", []),
+                tags=list(raw.get("tags") or []),
             )
             tool.finalize()
             results.append(tool)
         return results
 
 
-class JSONRPCOverHTTPClient(DownstreamClient):
+class MCPClientLibraryClient(DownstreamClient):
     def __init__(self, config: ClientConfig):
         super().__init__(config)
-        self._client = httpx.AsyncClient(timeout=config.request_timeout_seconds, follow_redirects=True)
-        assert config.url is not None
-        self.endpoint = config.url
-        self._session_id: str | None = None
+        self._persistent_session: ClientSession | None = None
+        self._persistent_stack: contextlib.AsyncExitStack | None = None
+        self._session_lock = asyncio.Lock()
 
     async def initialize(self) -> None:
-        payload = {
-            "jsonrpc": JSONRPC_VERSION,
-            "id": self.next_request_id(),
-            "method": "initialize",
-            "params": {
-                "protocolVersion": self.config.protocol_version or "2025-11-05",
-                "capabilities": {"tools": {"listChanged": True}},
-                "clientInfo": {"name": "virtual-mcp-gateway", "version": "0.1.0"},
-            },
-        }
-        headers = dict(self.config.headers)
-        response = await self._client.post(self.endpoint, json=payload, headers=headers)
-        response.raise_for_status()
-        self._session_id = response.headers.get("Mcp-Session-Id") or response.headers.get("mcp-session-id")
-        _ = response.json()
-        await self.notify_initialized()
+        await self._ensure_persistent_session()
 
     async def notify_initialized(self) -> None:
-        payload = {"jsonrpc": JSONRPC_VERSION, "method": "notifications/initialized", "params": {}}
-        headers = dict(self.config.headers)
-        if self._session_id:
-            headers["Mcp-Session-Id"] = self._session_id
-        response = await self._client.post(self.endpoint, json=payload, headers=headers)
-        response.raise_for_status()
-
-    async def _post(self, method: str, params: Dict[str, Any], forwarded_headers: Optional[Dict[str, str]] = None) -> Any:
-        headers = dict(self.config.headers)
-        if self._session_id:
-            headers["Mcp-Session-Id"] = self._session_id
-        if forwarded_headers:
-            headers.update(forwarded_headers)
-        payload = {
-            "jsonrpc": JSONRPC_VERSION,
-            "id": self.next_request_id(),
-            "method": method,
-            "params": params,
-        }
-        response = await self._client.post(self.endpoint, json=payload, headers=headers)
-        response.raise_for_status()
-        body = response.json()
-        if "error" in body:
-            raise MCPError(f"HTTP downstream error for {method}: {body['error']}")
-        return body.get("result", {})
+        return None
 
     async def list_tools(self, forwarded_headers: Optional[Dict[str, str]] = None) -> List[DownstreamTool]:
-        result = await self._post("tools/list", {}, forwarded_headers=forwarded_headers)
-        return self._normalize_tools(result.get("tools", []))
+        try:
+            if self._should_use_transient_session(forwarded_headers):
+                result = await self._run_with_temporary_session(
+                    forwarded_headers,
+                    lambda session: self._list_tools_with_session(session, forwarded_headers=forwarded_headers),
+                )
+            else:
+                session = await self._ensure_persistent_session()
+                result = await self._list_tools_with_session(session, forwarded_headers=forwarded_headers)
+            return self._normalize_tools(list(result.tools))
+        except Exception as exc:
+            raise MCPError(f"{self.config.transport} downstream error for tools/list: {exc}") from exc
 
     async def call_tool(
         self,
@@ -155,150 +144,255 @@ class JSONRPCOverHTTPClient(DownstreamClient):
         arguments: Dict[str, Any],
         forwarded_headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        result = await self._post(
-            "tools/call",
-            {"name": tool_name, "arguments": arguments},
-            forwarded_headers=forwarded_headers,
+        try:
+            if self._should_use_transient_session(forwarded_headers):
+                result = await self._run_with_temporary_session(
+                    forwarded_headers,
+                    lambda session: self._call_tool_with_session(
+                        session,
+                        tool_name,
+                        arguments,
+                        forwarded_headers=forwarded_headers,
+                    ),
+                )
+            else:
+                session = await self._ensure_persistent_session()
+                result = await self._call_tool_with_session(
+                    session,
+                    tool_name,
+                    arguments,
+                    forwarded_headers=forwarded_headers,
+                )
+            return _model_to_dict(result)
+        except Exception as exc:
+            raise MCPError(f"{self.config.transport} downstream error for tools/call: {exc}") from exc
+
+    async def close(self) -> None:
+        async with self._session_lock:
+            self._initialized = False
+            self.cached_tools = {}
+            self._persistent_session = None
+            stack, self._persistent_stack = self._persistent_stack, None
+        if stack is not None:
+            await stack.aclose()
+
+    async def _ensure_persistent_session(self) -> ClientSession:
+        async with self._session_lock:
+            if self._persistent_session is not None:
+                return self._persistent_session
+
+            stack = contextlib.AsyncExitStack()
+            try:
+                session = await self._open_session(stack, forwarded_headers=None)
+            except Exception:
+                await stack.aclose()
+                raise
+
+            self._persistent_stack = stack
+            self._persistent_session = session
+            return session
+
+    async def _run_with_temporary_session(self, forwarded_headers: Optional[Dict[str, str]], operation: Any) -> Any:
+        async with contextlib.AsyncExitStack() as stack:
+            session = await self._open_session(stack, forwarded_headers=forwarded_headers)
+            return await operation(session)
+
+    async def _open_session(
+        self,
+        stack: contextlib.AsyncExitStack,
+        forwarded_headers: Optional[Dict[str, str]],
+    ) -> ClientSession:
+        _require_mcp_sdk(self.config.transport)
+        streams = await stack.enter_async_context(self._transport_context(forwarded_headers))
+        read_stream, write_stream = streams[:2]
+        session = ClientSession(read_stream, write_stream)
+        await stack.enter_async_context(session)
+        await self._initialize_session(session)
+        return session
+
+    async def _initialize_session(self, session: ClientSession) -> None:
+        if not self.config.protocol_version:
+            await session.initialize()
+            return
+
+        assert mcp_types is not None
+        await session.send_request(
+            mcp_types.ClientRequest(
+                mcp_types.InitializeRequest(
+                    method="initialize",
+                    params=mcp_types.InitializeRequestParams(
+                        protocolVersion=self.config.protocol_version,
+                        capabilities=mcp_types.ClientCapabilities(
+                            sampling=mcp_types.SamplingCapability(),
+                            roots=mcp_types.RootsCapability(listChanged=True),
+                        ),
+                        clientInfo=mcp_types.Implementation(
+                            name=CLIENT_NAME,
+                            version=CLIENT_VERSION,
+                        ),
+                    ),
+                )
+            ),
+            mcp_types.InitializeResult,
         )
-        return result
+        await session.send_notification(
+            mcp_types.ClientNotification(
+                mcp_types.InitializedNotification(method="notifications/initialized")
+            )
+        )
+
+    async def _list_tools_with_session(
+        self,
+        session: ClientSession,
+        forwarded_headers: Optional[Dict[str, str]] = None,
+    ) -> Any:
+        return await session.list_tools()
+
+    async def _call_tool_with_session(
+        self,
+        session: ClientSession,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        forwarded_headers: Optional[Dict[str, str]] = None,
+    ) -> Any:
+        return await session.call_tool(tool_name, arguments=arguments)
+
+    def _should_use_transient_session(self, forwarded_headers: Optional[Dict[str, str]]) -> bool:
+        return False
+
+    @abc.abstractmethod
+    def _transport_context(self, forwarded_headers: Optional[Dict[str, str]]) -> Any:
+        raise NotImplementedError
 
 
-class SSEMCPClient(JSONRPCOverHTTPClient):
-    """Compatibility client.
+class StreamableHTTPMCPClient(MCPClientLibraryClient):
+    def __init__(self, config: ClientConfig):
+        super().__init__(config)
+        if not config.url:
+            raise ValueError(f"streamable-http client {config.server_id} requires url")
+        self.endpoint = config.url
 
-    Many legacy SSE servers still accept JSON-RPC POST requests on the same endpoint,
-    while optionally using SSE for server-initiated events. This adapter keeps the same
-    request behavior but is labeled separately in configuration so you can evolve it later.
-    """
+    def _should_use_transient_session(self, forwarded_headers: Optional[Dict[str, str]]) -> bool:
+        return bool(forwarded_headers)
+
+    @contextlib.asynccontextmanager
+    async def _transport_context(self, forwarded_headers: Optional[Dict[str, str]]) -> Any:
+        _require_mcp_sdk(self.config.transport, require_streamable_http=True)
+        headers = _merge_headers(self.config.headers, forwarded_headers)
+        timeout = httpx.Timeout(self.config.request_timeout_seconds)
+        async with httpx.AsyncClient(
+            headers=headers or None,
+            timeout=timeout,
+            follow_redirects=True,
+        ) as client:
+            async with streamable_http_client(
+                self.endpoint,
+                http_client=client,
+                terminate_on_close=False,
+            ) as streams:
+                yield streams
 
 
-class StdioMCPClient(DownstreamClient):
+class SSEMCPClient(MCPClientLibraryClient):
+    def __init__(self, config: ClientConfig):
+        super().__init__(config)
+        if not config.url:
+            raise ValueError(f"sse client {config.server_id} requires url")
+        self.endpoint = config.url
+
+    def _should_use_transient_session(self, forwarded_headers: Optional[Dict[str, str]]) -> bool:
+        return bool(forwarded_headers)
+
+    @contextlib.asynccontextmanager
+    async def _transport_context(self, forwarded_headers: Optional[Dict[str, str]]) -> Any:
+        _require_mcp_sdk(self.config.transport)
+        headers = _merge_headers(self.config.headers, forwarded_headers)
+        async with sse_client(
+            self.endpoint,
+            headers=headers or None,
+            timeout=self.config.request_timeout_seconds,
+            sse_read_timeout=max(self.config.request_timeout_seconds, 300),
+        ) as streams:
+            yield streams
+
+
+class StdioMCPClient(MCPClientLibraryClient):
     def __init__(self, config: ClientConfig):
         super().__init__(config)
         if not config.command:
             raise ValueError(f"stdio client {config.server_id} requires command")
-        self._proc: asyncio.subprocess.Process | None = None
-        self._stdout_task: asyncio.Task[None] | None = None
-        self._pending: Dict[int, asyncio.Future[Any]] = {}
 
-    async def _start(self) -> None:
-        if self._proc is not None:
-            return
-        env = None
-        self._proc = await asyncio.create_subprocess_exec(
-            *self.config.command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=env,
+    @contextlib.asynccontextmanager
+    async def _transport_context(self, forwarded_headers: Optional[Dict[str, str]]) -> Any:
+        _require_mcp_sdk(self.config.transport)
+        assert StdioServerParameters is not None
+        params = StdioServerParameters(
+            command=self.config.command[0],
+            args=self.config.command[1:],
         )
-        self._stdout_task = asyncio.create_task(self._read_stdout())
-        asyncio.create_task(self._read_stderr())
+        async with stdio_client(params) as streams:
+            yield streams
 
-    async def _read_stdout(self) -> None:
-        assert self._proc is not None and self._proc.stdout is not None
-        while True:
-            line = await self._proc.stdout.readline()
-            if not line:
-                break
-            try:
-                message = json.loads(line.decode("utf-8").strip())
-            except Exception:
-                logger.warning("Failed to decode stdio JSON line from %s: %r", self.server_id, line)
-                continue
-            if "id" in message:
-                future = self._pending.pop(int(message["id"]), None)
-                if future and not future.done():
-                    future.set_result(message)
-            elif message.get("method") == "notifications/tools/list_changed":
-                logger.info("Downstream %s emitted tools/list_changed", self.server_id)
-            else:
-                logger.debug("Received stdio notification from %s: %s", self.server_id, message)
-
-    async def _read_stderr(self) -> None:
-        assert self._proc is not None and self._proc.stderr is not None
-        while True:
-            line = await self._proc.stderr.readline()
-            if not line:
-                break
-            logger.info("[%s stderr] %s", self.server_id, line.decode("utf-8").rstrip())
-
-    async def _send(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        await self._start()
-        assert self._proc is not None and self._proc.stdin is not None
-        request_id = self.next_request_id()
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[Any] = loop.create_future()
-        self._pending[request_id] = future
-        payload = {
-            "jsonrpc": JSONRPC_VERSION,
-            "id": request_id,
-            "method": method,
-            "params": params,
-        }
-        body = json.dumps(payload, separators=(",", ":")) + "\n"
-        self._proc.stdin.write(body.encode("utf-8"))
-        await self._proc.stdin.drain()
-        message = await asyncio.wait_for(future, timeout=self.config.request_timeout_seconds)
-        if "error" in message:
-            raise MCPError(f"stdio downstream error for {method}: {message['error']}")
-        return message.get("result", {})
-
-    async def initialize(self) -> None:
-        await self._send(
-            "initialize",
-            {
-                "protocolVersion": self.config.protocol_version or "2025-11-05",
-                "capabilities": {"tools": {"listChanged": True}},
-                "clientInfo": {"name": "virtual-mcp-gateway", "version": "0.1.0"},
-            },
-        )
-        await self.notify_initialized()
-
-    async def notify_initialized(self) -> None:
-        await self._start()
-        assert self._proc is not None and self._proc.stdin is not None
-        payload = {
-            "jsonrpc": JSONRPC_VERSION,
-            "method": "notifications/initialized",
-            "params": {},
-        }
-        self._proc.stdin.write((json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8"))
-        await self._proc.stdin.drain()
-
-    async def list_tools(self, forwarded_headers: Optional[Dict[str, str]] = None) -> List[DownstreamTool]:
-        result = await self._send("tools/list", {"_forwarded_headers": forwarded_headers or {}})
-        return self._normalize_tools(result.get("tools", []))
-
-    async def call_tool(
+    async def _call_tool_with_session(
         self,
+        session: ClientSession,
         tool_name: str,
         arguments: Dict[str, Any],
         forwarded_headers: Optional[Dict[str, str]] = None,
-    ) -> Dict[str, Any]:
-        return await self._send(
-            "tools/call",
-            {"name": tool_name, "arguments": arguments, "_forwarded_headers": forwarded_headers or {}},
+    ) -> Any:
+        assert mcp_types is not None
+        payload: Dict[str, Any] = {
+            "name": tool_name,
+            "arguments": arguments,
+        }
+        if forwarded_headers:
+            payload["_forwarded_headers"] = dict(forwarded_headers)
+        return await session.send_request(
+            mcp_types.ClientRequest(
+                mcp_types.CallToolRequest(
+                    method="tools/call",
+                    params=mcp_types.CallToolRequestParams(**payload),
+                )
+            ),
+            mcp_types.CallToolResult,
         )
-
-    async def close(self) -> None:
-        if self._stdout_task is not None:
-            self._stdout_task.cancel()
-            with contextlib.suppress(Exception):
-                await self._stdout_task
-        if self._proc is not None:
-            self._proc.terminate()
-            with contextlib.suppress(ProcessLookupError):
-                await self._proc.wait()
-            self._proc = None
 
 
 def build_client(config: ClientConfig) -> DownstreamClient:
     transport = config.transport.lower()
     if transport in {"http", "streamable-http", "streamable_http"}:
-        return JSONRPCOverHTTPClient(config)
+        return StreamableHTTPMCPClient(config)
     if transport == "sse":
         return SSEMCPClient(config)
     if transport == "stdio":
         return StdioMCPClient(config)
     raise ValueError(f"Unsupported transport: {config.transport}")
+
+
+def _merge_headers(*groups: Optional[Dict[str, str]]) -> Dict[str, str]:
+    merged: Dict[str, str] = {}
+    for group in groups:
+        if group:
+            merged.update(group)
+    return merged
+
+
+def _model_to_dict(value: Any) -> Dict[str, Any]:
+    if hasattr(value, "model_dump"):
+        return value.model_dump(by_alias=True, mode="json", exclude_none=True)
+    if isinstance(value, dict):
+        return dict(value)
+    raise TypeError(f"Unsupported MCP response payload type: {type(value)!r}")
+
+
+def _require_mcp_sdk(transport: str, require_streamable_http: bool = False) -> None:
+    if _MCP_IMPORT_ERROR is not None and (ClientSession is None or mcp_types is None):
+        raise RuntimeError(
+            "The MCP Python SDK is required for downstream clients. "
+            "Install a recent `mcp` package before starting the gateway."
+        ) from _MCP_IMPORT_ERROR
+    if require_streamable_http and streamable_http_client is None:
+        raise RuntimeError(
+            f"Transport {transport!r} requires an MCP SDK version that includes "
+            "`mcp.client.streamable_http.streamable_http_client`."
+        ) from _MCP_IMPORT_ERROR

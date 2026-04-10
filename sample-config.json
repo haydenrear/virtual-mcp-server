@@ -20,7 +20,7 @@
     {
       "server_id": "legacy_sse",
       "transport": "sse",
-      "url": "http://127.0.0.1:9100/mcp",
+      "url": "http://127.0.0.1:9100/sse",
       "tool_path_prefix": "sse/legacy"
     }
   ]

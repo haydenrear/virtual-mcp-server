@@ -47,18 +47,24 @@ class DownstreamTool:
 
 @dataclass(slots=True)
 class ToolDisclosure:
-    tool_path: str
-    schema_digest: str
+    path: str
     disclosed_at: float
     expires_at: Optional[float] = None
 
-    def is_valid(self, digest: str, now: float | None = None) -> bool:
+    def is_valid(self, now: float | None = None) -> bool:
         current = time.time() if now is None else now
-        if self.schema_digest != digest:
-            return False
         if self.expires_at is not None and current > self.expires_at:
             return False
         return True
+
+    def allows(self, tool_path: str, now: float | None = None) -> bool:
+        if not self.is_valid(now=now):
+            return False
+        normalized_disclosure = self.path.strip("/")
+        normalized_tool_path = tool_path.strip("/")
+        if normalized_disclosure == normalized_tool_path:
+            return True
+        return normalized_tool_path.startswith(f"{normalized_disclosure}/")
 
 
 @dataclass(slots=True)
@@ -67,20 +73,19 @@ class SessionState:
     disclosures: Dict[str, ToolDisclosure] = field(default_factory=dict)
     last_headers: Dict[str, str] = field(default_factory=dict)
 
-    def disclose(self, tool_path: str, digest: str, ttl_seconds: int | None = None) -> ToolDisclosure:
+    def disclose(self, path: str, ttl_seconds: int | None = None) -> ToolDisclosure:
         now = time.time()
         disclosure = ToolDisclosure(
-            tool_path=tool_path,
-            schema_digest=digest,
+            path=path.strip("/"),
             disclosed_at=now,
             expires_at=None if ttl_seconds is None else now + ttl_seconds,
         )
-        self.disclosures[tool_path] = disclosure
+        self.disclosures[disclosure.path] = disclosure
         return disclosure
 
-    def validate(self, tool_path: str, digest: str) -> bool:
-        disclosure = self.disclosures.get(tool_path)
-        return disclosure is not None and disclosure.is_valid(digest)
+    def validate(self, tool_path: str) -> bool:
+        normalized_tool_path = tool_path.strip("/")
+        return any(disclosure.allows(normalized_tool_path) for disclosure in self.disclosures.values())
 
 
 @dataclass(slots=True)

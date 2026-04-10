@@ -6,7 +6,7 @@ import time
 from typing import Dict, Iterable, List, Optional
 
 from .clients import DownstreamClient
-from .models import ClientConfig, DownstreamTool, SessionState
+from .models import DownstreamTool, SessionState
 from .semantic import SemanticMatcher
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,11 @@ class ToolRegistry:
         if self._refresh_task is not None:
             self._refresh_task.cancel()
             self._refresh_task = None
+        for server_id, client in self.clients.items():
+            try:
+                await client.close()
+            except Exception:
+                logger.exception("Failed closing downstream client %s", server_id)
 
     async def _refresh_loop(self) -> None:
         while True:
@@ -97,7 +102,6 @@ class ToolRegistry:
                 "description": hit.tool.description,
                 "score": hit.score,
                 "reason": hit.reason,
-                "schema_digest": hit.tool.schema_digest,
             }
             for hit in hits
         ]
