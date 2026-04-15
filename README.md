@@ -75,3 +75,10 @@ python -m gateway.server --config sample-config.json --host 127.0.0.1 --port 808
 ```json
 {"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"invoke_tool","arguments":{"tool_path":"http/remote/github/search_repos","arguments":{"query":"model context protocol"}}}}
 ```
+
+
+# MCP Marketplace
+
+This gives you the opportunity for agents to discovery MCP servers and deploy them themselves. Then they can show the schema for only one tool.
+
+The main pain-point is the disclosure of every tool, every resource, etc. This allows that pain point to be relieved by using the agent's own tool registry and instructions on progressive disclosure. So now an agent can, in a skill, discover a reference to an MCP server that they can configure and show only the schema for one tool, with their own initialization parameters.

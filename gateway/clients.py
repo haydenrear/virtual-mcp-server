@@ -326,9 +326,11 @@ class StdioMCPClient(MCPClientLibraryClient):
     async def _transport_context(self, forwarded_headers: Optional[Dict[str, str]]) -> Any:
         _require_mcp_sdk(self.config.transport)
         assert StdioServerParameters is not None
+
         params = StdioServerParameters(
             command=self.config.command[0],
             args=self.config.command[1:],
+            env=getattr(self.config, "env", None),  # optional later
         )
         async with stdio_client(params) as streams:
             yield streams
