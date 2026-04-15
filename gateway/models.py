@@ -11,6 +11,119 @@ JsonObject = Dict[str, Any]
 
 
 @dataclass(slots=True)
+class InitSchemaField:
+    name: str
+    type: str = "string"
+    description: str = ""
+    required: bool = False
+    secret: bool = False
+    default: Any = None
+    enum: List[str] = field(default_factory=list)
+
+    def to_public_dict(self) -> JsonObject:
+        payload: JsonObject = {
+            "name": self.name,
+            "type": self.type,
+            "description": self.description,
+            "required": self.required,
+            "secret": self.secret,
+        }
+        if self.default is not None and not self.secret:
+            payload["default"] = self.default
+        if self.enum:
+            payload["enum"] = list(self.enum)
+        return payload
+
+
+@dataclass(slots=True)
+class ClientConfig:
+    server_id: str
+    transport: str
+    command: List[str] | None = None
+    url: str | None = None
+    headers: Dict[str, str] = field(default_factory=dict)
+    namespace: str = ""
+    tool_path_prefix: str = ""
+    protocol_version: str | None = None
+    refresh_interval_seconds: int = 30
+    startup_timeout_seconds: int = 20
+    request_timeout_seconds: int = 60
+    env_header_prefix: str = "x-env-"
+    include_header_names: List[str] = field(default_factory=list)
+    exclude_header_names: List[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class MCPServerDefinition:
+    server_id: str
+    display_name: str
+    description: str
+    client: ClientConfig
+    init_schema: List[InitSchemaField] = field(default_factory=list)
+    save_last_init: bool = True
+    idle_timeout_seconds: int | None = 1800
+    auto_deploy: bool = False
+
+    def schema_dict(self) -> List[JsonObject]:
+        return [field.to_public_dict() for field in self.init_schema]
+
+    def secret_field_names(self) -> set[str]:
+        return {field.name for field in self.init_schema if field.secret}
+
+    def validate_init(self, values: JsonObject) -> JsonObject:
+        incoming = dict(values or {})
+        result: JsonObject = {}
+        for field_def in self.init_schema:
+            if field_def.name in incoming:
+                value = incoming[field_def.name]
+            elif field_def.default is not None:
+                value = field_def.default
+            elif field_def.required:
+                raise ValueError(f"Missing required initialization field: {field_def.name}")
+            else:
+                continue
+
+            if field_def.enum and value not in field_def.enum:
+                raise ValueError(
+                    f"Invalid value for {field_def.name}: {value!r}. "
+                    f"Allowed: {field_def.enum}"
+                )
+            result[field_def.name] = value
+        return result
+
+    def redact_init(self, values: JsonObject | None) -> JsonObject:
+        source = dict(values or {})
+        secrets = self.secret_field_names()
+        return {
+            key: ("***" if key in secrets else value)
+            for key, value in source.items()
+        }
+
+
+@dataclass(slots=True)
+class MCPServerDeployment:
+    server_id: str
+    initialized_at: float
+    last_used_at: float
+    init_values: JsonObject = field(default_factory=dict)
+    deployed: bool = True
+
+    def touch(self) -> None:
+        self.last_used_at = time.time()
+
+    def expires_at(self, idle_timeout_seconds: int | None) -> float | None:
+        if idle_timeout_seconds is None:
+            return None
+        return self.last_used_at + idle_timeout_seconds
+
+    def is_expired(self, idle_timeout_seconds: int | None, now: float | None = None) -> bool:
+        if idle_timeout_seconds is None:
+            return False
+        current = time.time() if now is None else now
+        return current > (self.last_used_at + idle_timeout_seconds)
+
+
+@dataclass(slots=True)
 class DownstreamTool:
     server_id: str
     tool_name: str
@@ -28,10 +141,7 @@ class DownstreamTool:
     def finalize(self) -> None:
         if not self.path:
             prefix = self.namespace.strip("/")
-            if prefix:
-                self.path = f"{prefix}/{self.tool_name}"
-            else:
-                self.path = self.tool_name
+            self.path = f"{prefix}/{self.tool_name}" if prefix else self.tool_name
         if not self.schema_digest:
             self.schema_digest = stable_digest(
                 {
@@ -93,24 +203,6 @@ class SearchHit:
     tool: DownstreamTool
     score: float
     reason: str
-
-
-@dataclass(slots=True)
-class ClientConfig:
-    server_id: str
-    transport: str
-    command: List[str] | None = None
-    url: str | None = None
-    headers: Dict[str, str] = field(default_factory=dict)
-    namespace: str = ""
-    tool_path_prefix: str = ""
-    protocol_version: str | None = None
-    refresh_interval_seconds: int = 30
-    startup_timeout_seconds: int = 20
-    request_timeout_seconds: int = 60
-    env_header_prefix: str = "x-env-"
-    include_header_names: List[str] = field(default_factory=list)
-    exclude_header_names: List[str] = field(default_factory=list)
 
 
 def stable_digest(value: Any) -> str:
